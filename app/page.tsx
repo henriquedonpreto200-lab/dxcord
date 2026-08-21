@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { supabase } from "@/lib/supabase";
 
 type Message = {
@@ -9,6 +9,378 @@ type Message = {
   text: string;
   created_at: string;
 };
+
+
+type VoiceSignal = {
+  type: "join" | "offer" | "answer" | "candidate" | "leave";
+  from: string;
+  to?: string;
+  name?: string;
+  offer?: RTCSessionDescriptionInit;
+  answer?: RTCSessionDescriptionInit;
+  candidate?: RTCIceCandidateInit;
+};
+
+function VoiceChannel({ userName }: { userName: string }) {
+  const [connected, setConnected] = useState(false);
+  const [muted, setMuted] = useState(false);
+  const [members, setMembers] = useState<string[]>([]);
+
+  const myId = useRef(
+    typeof crypto !== "undefined"
+      ? crypto.randomUUID()
+      : Math.random().toString(36).slice(2)
+  );
+
+  const channelRef = useRef<any>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const peersRef = useRef<Record<string, RTCPeerConnection>>({});
+  const namesRef = useRef<Record<string, string>>({});
+  const audioRefs = useRef<Record<string, HTMLAudioElement>>({});
+
+  function sendSignal(payload: VoiceSignal) {
+    channelRef.current?.send({
+      type: "broadcast",
+      event: "signal",
+      payload,
+    });
+  }
+
+  async function createPeer(peerId: string, makeOffer: boolean) {
+    if (peersRef.current[peerId]) {
+      return peersRef.current[peerId];
+    }
+
+    const peer = new RTCPeerConnection({
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" },
+      ],
+    });
+
+    peersRef.current[peerId] = peer;
+
+    streamRef.current?.getTracks().forEach((track) => {
+      peer.addTrack(track, streamRef.current!);
+    });
+
+    peer.onicecandidate = (event) => {
+      if (!event.candidate) return;
+
+      sendSignal({
+        type: "candidate",
+        from: myId.current,
+        to: peerId,
+        candidate: event.candidate.toJSON(),
+      });
+    };
+
+    peer.ontrack = (event) => {
+      const stream = event.streams[0];
+      if (!stream) return;
+
+      let audio = audioRefs.current[peerId];
+
+      if (!audio) {
+        audio = document.createElement("audio");
+        audio.autoplay = true;
+        audio.setAttribute("playsinline", "true");
+        audioRefs.current[peerId] = audio;
+        document.body.appendChild(audio);
+      }
+
+      audio.srcObject = stream;
+      audio.play().catch(() => {});
+    };
+
+    peer.onconnectionstatechange = () => {
+      if (
+        peer.connectionState === "failed" ||
+        peer.connectionState === "disconnected" ||
+        peer.connectionState === "closed"
+      ) {
+        peer.close();
+        delete peersRef.current[peerId];
+
+        audioRefs.current[peerId]?.remove();
+        delete audioRefs.current[peerId];
+
+        setMembers((old) => old.filter((id) => id !== peerId));
+      }
+    };
+
+    if (makeOffer) {
+      const offer = await peer.createOffer();
+      await peer.setLocalDescription(offer);
+
+      sendSignal({
+        type: "offer",
+        from: myId.current,
+        to: peerId,
+        name: userName,
+        offer,
+      });
+    }
+
+    return peer;
+  }
+
+  async function joinCall() {
+    if (connected) return;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        video: false,
+      });
+
+      streamRef.current = stream;
+
+      const channel = supabase.channel("dxcord-voice-geral", {
+        config: {
+          broadcast: {
+            self: false,
+          },
+        },
+      });
+
+      channelRef.current = channel;
+
+      channel.on(
+        "broadcast",
+        { event: "signal" },
+        async ({ payload }: { payload: VoiceSignal }) => {
+          if (!payload || payload.from === myId.current) return;
+
+          try {
+            if (payload.type === "join") {
+              namesRef.current[payload.from] = payload.name || "Usuário";
+
+              setMembers((old) =>
+                old.includes(payload.from)
+                  ? old
+                  : [...old, payload.from]
+              );
+
+              await createPeer(payload.from, true);
+              return;
+            }
+
+            if (payload.type === "offer") {
+              if (payload.to !== myId.current) return;
+
+              namesRef.current[payload.from] = payload.name || "Usuário";
+
+              setMembers((old) =>
+                old.includes(payload.from)
+                  ? old
+                  : [...old, payload.from]
+              );
+
+              const peer = await createPeer(payload.from, false);
+
+              await peer.setRemoteDescription(
+                new RTCSessionDescription(payload.offer!)
+              );
+
+              const answer = await peer.createAnswer();
+              await peer.setLocalDescription(answer);
+
+              sendSignal({
+                type: "answer",
+                from: myId.current,
+                to: payload.from,
+                answer,
+              });
+
+              return;
+            }
+
+            if (payload.type === "answer") {
+              if (payload.to !== myId.current) return;
+
+              const peer = peersRef.current[payload.from];
+              if (!peer) return;
+
+              await peer.setRemoteDescription(
+                new RTCSessionDescription(payload.answer!)
+              );
+
+              return;
+            }
+
+            if (payload.type === "candidate") {
+              if (payload.to !== myId.current) return;
+
+              const peer = peersRef.current[payload.from];
+              if (!peer || !payload.candidate) return;
+
+              await peer.addIceCandidate(
+                new RTCIceCandidate(payload.candidate)
+              );
+
+              return;
+            }
+
+            if (payload.type === "leave") {
+              const peer = peersRef.current[payload.from];
+
+              if (peer) {
+                peer.close();
+                delete peersRef.current[payload.from];
+              }
+
+              audioRefs.current[payload.from]?.remove();
+              delete audioRefs.current[payload.from];
+
+              setMembers((old) =>
+                old.filter((id) => id !== payload.from)
+              );
+            }
+          } catch (error) {
+            console.error("Erro na call de voz:", error);
+          }
+        }
+      );
+
+      await channel.subscribe();
+
+      sendSignal({
+        type: "join",
+        from: myId.current,
+        name: userName,
+      });
+
+      setConnected(true);
+      setMuted(false);
+    } catch (error) {
+      console.error("Erro ao acessar o microfone:", error);
+
+      alert(
+        "Não foi possível acessar o microfone. Permita o acesso ao microfone no navegador e tente novamente."
+      );
+    }
+  }
+
+  async function leaveCall() {
+    if (!connected) return;
+
+    sendSignal({
+      type: "leave",
+      from: myId.current,
+    });
+
+    Object.values(peersRef.current).forEach((peer) => peer.close());
+    peersRef.current = {};
+
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+
+    Object.values(audioRefs.current).forEach((audio) => audio.remove());
+    audioRefs.current = {};
+
+    if (channelRef.current) {
+      await channelRef.current.unsubscribe();
+      channelRef.current = null;
+    }
+
+    setMembers([]);
+    setConnected(false);
+    setMuted(false);
+  }
+
+  function toggleMute() {
+    const tracks = streamRef.current?.getAudioTracks() ?? [];
+    if (!tracks.length) return;
+
+    const nextMuted = tracks[0].enabled;
+
+    tracks.forEach((track) => {
+      track.enabled = !nextMuted;
+    });
+
+    setMuted(nextMuted);
+  }
+
+  useEffect(() => {
+    return () => {
+      Object.values(peersRef.current).forEach((peer) => peer.close());
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      Object.values(audioRefs.current).forEach((audio) => audio.remove());
+
+      if (channelRef.current) {
+        supabase.removeChannel(channelRef.current);
+      }
+    };
+  }, []);
+
+  return (
+    <div className="mt-1 rounded-md bg-[#404249] px-2 py-2">
+      <div className="flex items-center gap-2">
+        <span className="text-lg">🔊</span>
+
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-sm text-gray-200">Geral</p>
+          <p className="text-xs text-gray-400">
+            {connected
+              ? `${members.length + 1} conectado(s)`
+              : "Canal de voz"}
+          </p>
+        </div>
+
+        {!connected ? (
+          <button
+            type="button"
+            onClick={joinCall}
+            className="rounded bg-green-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-green-700"
+          >
+            Entrar
+          </button>
+        ) : (
+          <div className="flex gap-1">
+            <button
+              type="button"
+              onClick={toggleMute}
+              title={muted ? "Ativar microfone" : "Mutar microfone"}
+              className="rounded bg-[#2f3136] px-2 py-1.5 hover:bg-[#36393f]"
+            >
+              {muted ? "🔇" : "🎙️"}
+            </button>
+
+            <button
+              type="button"
+              onClick={leaveCall}
+              title="Sair da call"
+              className="rounded bg-red-600 px-2 py-1.5 hover:bg-red-700"
+            >
+              📞
+            </button>
+          </div>
+        )}
+      </div>
+
+      {connected && members.length > 0 && (
+        <div className="mt-2 border-t border-[#55565c] pt-2">
+          {members.map((id) => (
+            <div
+              key={id}
+              className="flex items-center gap-2 py-1 text-xs text-gray-300"
+            >
+              <span className="h-2 w-2 rounded-full bg-green-500" />
+              <span className="truncate">
+                {namesRef.current[id] || "Usuário"}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function Home() {
   const [email, setEmail] = useState("");
@@ -352,9 +724,7 @@ export default function Home() {
             CANAIS DE VOZ
           </p>
 
-          <div className="px-2 py-2 text-gray-400">
-            🔊 Geral
-          </div>
+          <VoiceChannel userName={currentUserName} />
 
         </div>
 
